@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--sample-rate", type=int, default=SAMPLE_RATE)
     parser.add_argument("--codec-chunk-duration", type=float, default=0.24)
+    parser.add_argument(
+        "--codec-decode-batch-size",
+        type=int,
+        default=16,
+        help="Decode waveform in subbatches after audio-token generation. 0 decodes the full microbatch at once.",
+    )
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.6)
     parser.add_argument("--top-k", type=int, default=30)
@@ -146,6 +152,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-audio-steps must be >= 0.")
     if args.prefill_text_len is not None and args.prefill_text_len < 1:
         raise ValueError("--prefill-text-len must be >= 1.")
+    if args.codec_decode_batch_size < 0:
+        raise ValueError("--codec-decode-batch-size must be >= 0.")
     return args
 
 
@@ -310,17 +318,50 @@ def append_valid_tokens(
     return appended
 
 
-def decode_batch(codec, codes_list: list[torch.Tensor], metrics: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+def decode_batch(
+    codec,
+    codes_list: list[torch.Tensor],
+    metrics: dict[str, Any],
+    *,
+    codec_decode_batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     sync_cuda_if_enabled(metrics)
     started = time.perf_counter()
-    decoded = codec.batch_decode(codes_list)
-    sync_cuda_if_enabled(metrics)
-    metrics["codec_batch_decode_s"] = metrics.get("codec_batch_decode_s", 0.0) + (time.perf_counter() - started)
-    metrics["codec_batch_decode_calls"] = metrics.get("codec_batch_decode_calls", 0) + 1
+    decode_batch_size = int(codec_decode_batch_size)
+    if decode_batch_size <= 0 or decode_batch_size >= len(codes_list):
+        decoded = codec.batch_decode(codes_list)
+        sync_cuda_if_enabled(metrics)
+        metrics["codec_batch_decode_s"] = metrics.get("codec_batch_decode_s", 0.0) + (time.perf_counter() - started)
+        metrics["codec_batch_decode_calls"] = metrics.get("codec_batch_decode_calls", 0) + 1
+        metrics["codec_decode_subbatch_count"] = metrics.get("codec_decode_subbatch_count", 0) + 1
+        metrics["codec_decode_effective_batch_size"] = len(codes_list)
+        audio = decoded["audio"] if isinstance(decoded, dict) else decoded.audio
+        lengths = decoded["audio_lengths"] if isinstance(decoded, dict) else decoded.audio_lengths
+        return audio.detach().cpu(), lengths.detach().cpu()
 
-    audio = decoded["audio"] if isinstance(decoded, dict) else decoded.audio
-    lengths = decoded["audio_lengths"] if isinstance(decoded, dict) else decoded.audio_lengths
-    return audio, lengths
+    audio_chunks = []
+    length_chunks = []
+    subbatch_count = 0
+    largest_subbatch = 0
+    for start_idx in range(0, len(codes_list), decode_batch_size):
+        sub_codes = codes_list[start_idx : start_idx + decode_batch_size]
+        subbatch_count += 1
+        largest_subbatch = max(largest_subbatch, len(sub_codes))
+        decoded = codec.batch_decode(sub_codes)
+        sync_cuda_if_enabled(metrics)
+        audio = decoded["audio"] if isinstance(decoded, dict) else decoded.audio
+        lengths = decoded["audio_lengths"] if isinstance(decoded, dict) else decoded.audio_lengths
+        audio_chunks.append(audio.detach().cpu())
+        length_chunks.append(lengths.detach().cpu())
+        del decoded, audio, lengths
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    metrics["codec_batch_decode_s"] = metrics.get("codec_batch_decode_s", 0.0) + (time.perf_counter() - started)
+    metrics["codec_batch_decode_calls"] = metrics.get("codec_batch_decode_calls", 0) + subbatch_count
+    metrics["codec_decode_subbatch_count"] = metrics.get("codec_decode_subbatch_count", 0) + subbatch_count
+    metrics["codec_decode_effective_batch_size"] = largest_subbatch
+    return torch.cat(audio_chunks, dim=0), torch.cat(length_chunks, dim=0)
 
 
 def reset_cuda_peak(device: torch.device) -> None:
@@ -334,6 +375,17 @@ def cuda_peak_memory(device: torch.device) -> dict[str, float]:
     return {
         "cuda_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / (1024**2),
         "cuda_peak_reserved_mib": torch.cuda.max_memory_reserved(device) / (1024**2),
+    }
+
+
+def cuda_peak_memory_for_stage(device: torch.device, stage: str) -> dict[str, float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {}
+    return {
+        f"{stage}_cuda_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / (1024**2),
+        f"{stage}_cuda_peak_reserved_mib": torch.cuda.max_memory_reserved(device) / (1024**2),
+        f"{stage}_cuda_current_allocated_mib": torch.cuda.memory_allocated(device) / (1024**2),
+        f"{stage}_cuda_current_reserved_mib": torch.cuda.memory_reserved(device) / (1024**2),
     }
 
 
@@ -416,6 +468,7 @@ def generate_microbatch(
     post_prefill_cursors = list(text_cursors)
 
     sync_cuda_if_enabled(metrics)
+    reset_cuda_peak(device)
     started = time.perf_counter()
     prefill_kwargs = dict(generation_kwargs)
     prefill_kwargs["repetition_penalty"] = None
@@ -426,6 +479,7 @@ def generate_microbatch(
     )
     sync_cuda_if_enabled(metrics)
     prefill_s = time.perf_counter() - started
+    prefill_memory = cuda_peak_memory_for_stage(device, "prefill")
     append_valid_tokens(
         first_tokens,
         per_sample_tokens,
@@ -435,6 +489,7 @@ def generate_microbatch(
     )
 
     sync_cuda_if_enabled(metrics)
+    reset_cuda_peak(device)
     started = time.perf_counter()
     step_count = 0
     appended_count = 0
@@ -468,6 +523,7 @@ def generate_microbatch(
         step_count += 1
     sync_cuda_if_enabled(metrics)
     generate_s = time.perf_counter() - started
+    generate_memory = cuda_peak_memory_for_stage(device, "generate")
 
     if not any(per_sample_tokens):
         raise RuntimeError("No valid audio tokens generated for this microbatch.")
@@ -481,7 +537,16 @@ def generate_microbatch(
         codes_list.append(codes)
         token_frames.append(int(codes.shape[-1]))
 
-    audio, lengths = decode_batch(codec, codes_list, metrics)
+    sync_cuda_if_enabled(metrics)
+    reset_cuda_peak(device)
+    audio, lengths = decode_batch(
+        codec,
+        codes_list,
+        metrics,
+        codec_decode_batch_size=args.codec_decode_batch_size,
+    )
+    sync_cuda_if_enabled(metrics)
+    decode_memory = cuda_peak_memory_for_stage(device, "codec_decode")
 
     write_started = time.perf_counter()
     records = []
@@ -489,7 +554,7 @@ def generate_microbatch(
     for local_idx, item in enumerate(items):
         stem = f"{item.idx:04d}_{safe_stem(item.item_id, f'item_{item.idx:04d}')}"
         wav_path = out_dir / f"{stem}.wav"
-        length = int(lengths[local_idx].detach().cpu().item())
+        length = int(lengths[local_idx].item())
         sample_count = write_pcm16_wav(wav_path, args.sample_rate, audio[local_idx, :, :length])
         total_audio_samples += sample_count
         try:
@@ -539,11 +604,31 @@ def generate_microbatch(
         "text_step_calls": text_step_calls,
         "drain_step_calls": drain_step_calls,
         "audio_token_frames_appended_after_prefill": appended_count,
+        "codec_decode_batch_size": args.codec_decode_batch_size,
+        "codec_decode_effective_batch_size": (
+            len(codes_list)
+            if args.codec_decode_batch_size <= 0
+            else min(args.codec_decode_batch_size, len(codes_list))
+        ),
         "max_audio_steps": args.max_audio_steps,
         "all_stopped": all(stopped),
         "items": records,
     }
-    batch_record.update(cuda_peak_memory(device))
+    batch_record.update(prefill_memory)
+    batch_record.update(generate_memory)
+    batch_record.update(decode_memory)
+    stage_alloc_peaks = [
+        batch_record.get("prefill_cuda_peak_allocated_mib"),
+        batch_record.get("generate_cuda_peak_allocated_mib"),
+        batch_record.get("codec_decode_cuda_peak_allocated_mib"),
+    ]
+    stage_reserved_peaks = [
+        batch_record.get("prefill_cuda_peak_reserved_mib"),
+        batch_record.get("generate_cuda_peak_reserved_mib"),
+        batch_record.get("codec_decode_cuda_peak_reserved_mib"),
+    ]
+    batch_record["cuda_peak_allocated_mib"] = max((x for x in stage_alloc_peaks if x is not None), default=None)
+    batch_record["cuda_peak_reserved_mib"] = max((x for x in stage_reserved_peaks if x is not None), default=None)
     return batch_record
 
 
@@ -589,6 +674,7 @@ def main() -> None:
         "max_audio_steps": args.max_audio_steps,
         "max_length": args.max_length,
         "sample_rate": args.sample_rate,
+        "codec_decode_batch_size": args.codec_decode_batch_size,
         "no_sample": args.no_sample,
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -673,6 +759,17 @@ def main() -> None:
     cuda_reserved_peaks = [batch.get("cuda_peak_reserved_mib") for batch in batch_records]
     metrics["max_cuda_peak_allocated_mib"] = max((x for x in cuda_peaks if x is not None), default=None)
     metrics["max_cuda_peak_reserved_mib"] = max((x for x in cuda_reserved_peaks if x is not None), default=None)
+    for stage in ("prefill", "generate", "codec_decode"):
+        alloc_key = f"{stage}_cuda_peak_allocated_mib"
+        reserved_key = f"{stage}_cuda_peak_reserved_mib"
+        metrics[f"max_{alloc_key}"] = max(
+            (batch.get(alloc_key) for batch in batch_records if batch.get(alloc_key) is not None),
+            default=None,
+        )
+        metrics[f"max_{reserved_key}"] = max(
+            (batch.get(reserved_key) for batch in batch_records if batch.get(reserved_key) is not None),
+            default=None,
+        )
 
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
@@ -695,11 +792,16 @@ def main() -> None:
         "total_text_step_calls",
         "total_drain_step_calls",
         "codec_batch_decode_s",
+        "codec_decode_batch_size",
+        "codec_decode_effective_batch_size",
         "total_batch_wall_s",
         "total_audio_duration_s",
         "audio_seconds_per_batch_wall_second",
         "audio_seconds_per_generate_second",
         "audio_seconds_per_process_second",
+        "max_prefill_cuda_peak_allocated_mib",
+        "max_generate_cuda_peak_allocated_mib",
+        "max_codec_decode_cuda_peak_allocated_mib",
         "max_cuda_peak_allocated_mib",
         "max_cuda_peak_reserved_mib",
     ):

@@ -179,6 +179,11 @@ throughput-only behavior is still available as `--packing-mode full-text`; that
 prefills the full text before audio-token drain and is not the deployment
 streaming layout.
 
+Waveform decode is subbatched by default with `--codec-decode-batch-size 16`.
+This keeps large rollout batches from OOMing in codec `batch_decode()` after
+audio-token generation has already succeeded. Pass `--codec-decode-batch-size 0`
+to decode the full microbatch at once when you know it fits.
+
 You can also pass a file:
 
 ```bash
@@ -194,15 +199,33 @@ The benchmark manifest separates setup, prompt encode, text prefill,
 interleaved text/audio stepping, codec batch decode, WAV writing, and aggregate
 generated audio seconds per wall second. It also records packing mode,
 prefill/stepped text-token counts, drain-step counts, and peak CUDA
-allocated/reserved memory per microbatch.
+allocated/reserved memory per microbatch, including separate peaks for prefill,
+interleaved token generation, and codec decode.
 
-On the 20 GB RTX A4500, an earlier short fixed-shape sweep with
+On the 20 GB RTX A4500, a longer interleaved sweep with about `166` text tokens
+per sample and `--max-audio-steps 192` generated about `15.44s` of audio per
+sample. This shape had `163` text-stepping calls and `29` final drain calls.
+
+| batch size | codec decode batch | audio seconds / batch wall second | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: | ---: |
+| 16 | full | 10.253 | 12.9 GiB | 14.0 GiB |
+| 32 | full | 19.458 | 14.7 GiB | 17.4 GiB |
+| 64 | full | OOM in codec decode | - | - |
+| 64 | 16 | 35.131 | 14.9 GiB | 18.4 GiB |
+| 96 | 16 | 47.913 | 16.3 GiB | 19.5 GiB |
+
+For the successful `96` run, the per-stage peaks were `14.1 GiB` prefill,
+`15.2 GiB` interleaved token generation, and `16.3 GiB` codec decode. So for
+this shape, codec decode was the largest allocation stage, but generation is
+also close enough that `96` should be treated as a high-throughput edge setting.
+Use `64` for more headroom or longer outputs.
+
+An earlier short fixed-shape sweep with
 `--packing-mode full-text --max-audio-steps 64` kept improving up to batch size
 `96`. Batch size `128` OOMed during codec waveform `batch_decode()`, not during
 audio-token generation. Treat `96` as the measured high-throughput cap for
 short full-text rollouts, and use `64` when you want more memory headroom or
-longer outputs. Re-run the sweep with `--packing-mode interleaved` and your
-target text/output lengths before using the cap for RL data generation.
+longer outputs.
 
 | batch size | audio seconds / batch wall second | peak allocated | peak reserved |
 | --- | ---: | ---: | ---: |
