@@ -309,6 +309,20 @@ def decode_batch(codec, codes_list: list[torch.Tensor], metrics: dict[str, Any])
     return audio, lengths
 
 
+def reset_cuda_peak(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def cuda_peak_memory(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return {}
+    return {
+        "cuda_peak_allocated_mib": torch.cuda.max_memory_allocated(device) / (1024**2),
+        "cuda_peak_reserved_mib": torch.cuda.max_memory_reserved(device) / (1024**2),
+    }
+
+
 def generate_microbatch(
     args: argparse.Namespace,
     tokenizer,
@@ -321,6 +335,8 @@ def generate_microbatch(
     metrics: dict[str, Any],
 ) -> dict[str, Any]:
     batch_started = time.perf_counter()
+    device = inferencer.device
+    reset_cuda_peak(device)
     tokenized = [tokenizer.encode(item.text, add_special_tokens=False) for item in items]
     empty = [item.item_id for item, ids in zip(items, tokenized) if not ids]
     if empty:
@@ -420,7 +436,7 @@ def generate_microbatch(
 
     batch_total_s = time.perf_counter() - batch_started
     audio_duration_s = total_audio_samples / float(args.sample_rate)
-    return {
+    batch_record = {
         "batch_index": batch_index,
         "batch_size": len(items),
         "prefill_s": prefill_s,
@@ -438,6 +454,8 @@ def generate_microbatch(
         "all_stopped": all(stopped),
         "items": records,
     }
+    batch_record.update(cuda_peak_memory(device))
+    return batch_record
 
 
 def benchmark_path(out_dir: Path, benchmark_json: str | None) -> Path:
@@ -546,6 +564,10 @@ def main() -> None:
     )
     metrics["audio_seconds_per_generate_second"] = total_audio_s / total_generate_s if total_generate_s else None
     metrics["audio_seconds_per_process_second"] = total_audio_s / metrics["process_total_s"] if metrics["process_total_s"] else None
+    cuda_peaks = [batch.get("cuda_peak_allocated_mib") for batch in batch_records]
+    cuda_reserved_peaks = [batch.get("cuda_peak_reserved_mib") for batch in batch_records]
+    metrics["max_cuda_peak_allocated_mib"] = max((x for x in cuda_peaks if x is not None), default=None)
+    metrics["max_cuda_peak_reserved_mib"] = max((x for x in cuda_reserved_peaks if x is not None), default=None)
 
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
@@ -567,6 +589,8 @@ def main() -> None:
         "audio_seconds_per_batch_wall_second",
         "audio_seconds_per_generate_second",
         "audio_seconds_per_process_second",
+        "max_cuda_peak_allocated_mib",
+        "max_cuda_peak_reserved_mib",
     ):
         print(f"{key}: {metrics.get(key)}")
     print(f"manifest_json: {manifest_path}")

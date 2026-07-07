@@ -183,10 +183,30 @@ Plain text files are read as one rollout per non-empty line. JSONL files should
 contain a `text` field and may include an `id` field for the output filename.
 The benchmark manifest separates setup, prompt encode, text prefill,
 autoregressive audio-token generation, codec batch decode, WAV writing, and
-aggregate generated audio seconds per wall second.
+aggregate generated audio seconds per wall second. It also records peak CUDA
+allocated/reserved memory per microbatch.
 
-On the 20 GB RTX A4500, start with batch size `2` and measure memory before
-trying `4+`; KV cache and generated-token history will grow with output length.
+On the 20 GB RTX A4500, a short fixed-shape sweep with `--max-audio-steps 64`
+kept improving up to batch size `96`. Batch size `128` OOMed during codec
+waveform `batch_decode()`, not during audio-token generation. Treat `96` as the
+measured high-throughput cap for short rollouts, and use `64` when you want more
+memory headroom or longer outputs.
+
+| batch size | audio seconds / batch wall second | peak allocated | peak reserved |
+| --- | ---: | ---: | ---: |
+| 1 | 0.654 | 11.1 GiB | 11.6 GiB |
+| 2 | 1.303 | 11.2 GiB | 11.6 GiB |
+| 4 | 2.642 | 11.3 GiB | 11.7 GiB |
+| 8 | 5.214 | 11.5 GiB | 12.0 GiB |
+| 16 | 9.700 | 11.9 GiB | 12.6 GiB |
+| 32 | 18.166 | 12.7 GiB | 13.7 GiB |
+| 64 | 33.345 | 14.2 GiB | 16.0 GiB |
+| 96 | 43.179 | 15.8 GiB | 18.1 GiB |
+| 128 | OOM in codec decode | 16.6 GiB allocated before OOM | 19.3 GiB process use |
+
+For longer rollouts, rerun the sweep with your target `--max-audio-steps`; KV
+cache, generated-token history, and codec decode memory all grow with output
+length.
 
 FlashAttention 2 was tested in a separate `.venv-fa2` environment so the stable
 demo `.venv` stayed untouched. It imports and runs, but on the local RTX A4500
