@@ -7,14 +7,21 @@ from pathlib import Path
 
 
 FIELDS = (
+    "runtime_profile",
+    "async_codec_decode",
     "decode_chunk_frames",
+    "drain_max_steps",
+    "first_drain_max_steps",
     "first_audio_chunk_s",
     "chunk_interval_p50_s",
     "chunk_interval_p95_s",
     "audio_seconds_per_wall_second",
     "audio_seconds_per_wall_second_after_first_chunk",
     "model_stream_calls_pct_stream",
+    "session_drain_calls",
     "codec_decode_s_pct_stream",
+    "async_audio_token_decode_worker_s_pct_stream",
+    "async_decode_input_queue_wait_s",
     "rtf_stream",
     "audio_duration_s",
     "audio_chunk_count",

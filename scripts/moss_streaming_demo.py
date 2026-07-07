@@ -9,14 +9,28 @@ import sys
 import time
 import wave
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from typing import Iterator
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+os.environ.setdefault("UV_CACHE_DIR", str(ROOT_DIR / ".uv-cache"))
+os.environ.setdefault("PIP_CACHE_DIR", str(ROOT_DIR / ".uv-cache" / "pip"))
+os.environ.setdefault("XDG_CACHE_HOME", str(ROOT_DIR / ".uv-cache" / "xdg"))
+os.environ.setdefault("HF_HOME", str(ROOT_DIR / ".hf-cache"))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(ROOT_DIR / ".hf-cache" / "hub"))
+os.environ.setdefault("TRANSFORMERS_CACHE", str(ROOT_DIR / ".hf-cache" / "transformers"))
+os.environ.setdefault("TORCH_HOME", str(ROOT_DIR / ".uv-cache" / "torch"))
+os.environ.setdefault("TRITON_CACHE_DIR", str(ROOT_DIR / ".uv-cache" / "triton"))
+os.environ.setdefault("VLLM_CACHE_ROOT", str(ROOT_DIR / ".uv-cache" / "vllm"))
+os.environ.setdefault("VLLM_CONFIG_ROOT", str(ROOT_DIR / ".uv-cache" / "vllm-config"))
+os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", str(ROOT_DIR / ".uv-cache" / "flashinfer-workspace"))
 
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
 from transformers.utils import logging as transformers_logging
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
 REALTIME_DIR = ROOT_DIR / "vendor" / "MOSS-TTS" / "moss_tts_realtime"
 if str(REALTIME_DIR) not in sys.path:
     sys.path.insert(0, str(REALTIME_DIR))
@@ -76,25 +90,56 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stream text deltas into MOSS-TTS-Realtime and save a WAV."
     )
+    parser.add_argument(
+        "--runtime-profile",
+        choices=["throughput", "interactive", "custom"],
+        default="throughput",
+        help="Default knob profile. Throughput prioritizes generated audio seconds per wall second; interactive prioritizes first/chunk cadence.",
+    )
     parser.add_argument("--model-path", default="OpenMOSS-Team/MOSS-TTS-Realtime")
     parser.add_argument("--codec-path", default="OpenMOSS-Team/MOSS-Audio-Tokenizer")
     parser.add_argument("--prompt-wav", default=str(ROOT_DIR / "prompts" / "jfk_berlin_12s.wav"))
     parser.add_argument("--out-wav", default=None, help="Defaults to outputs/moss_stream_<timestamp>.wav")
     parser.add_argument("--text", default=None, help="Text to stream. If omitted, text is read from stdin.")
-    parser.add_argument("--delta-chunk-chars", type=int, default=8)
+    parser.add_argument("--delta-chunk-chars", type=int, default=None)
     parser.add_argument("--delta-delay-s", type=float, default=0.0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--sample-rate", type=int, default=SAMPLE_RATE)
     parser.add_argument("--codec-chunk-duration", type=float, default=0.24)
-    parser.add_argument("--decode-chunk-frames", type=int, default=3)
-    parser.add_argument("--decode-overlap-frames", type=int, default=0)
+    parser.add_argument("--decode-chunk-frames", type=int, default=None)
+    parser.add_argument("--decode-overlap-frames", type=int, default=None)
+    parser.add_argument(
+        "--drain-max-steps",
+        type=int,
+        default=None,
+        help="Audio-token generation steps per post-text drain call after the first audio chunk has been emitted.",
+    )
+    parser.add_argument(
+        "--first-drain-max-steps",
+        type=int,
+        default=None,
+        help="Drain steps before the first decoded audio chunk. Keep this low to protect first-audio latency.",
+    )
+    parser.add_argument(
+        "--async-codec-decode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Decode audio-token batches on a worker thread so token generation can continue while codec chunks are produced.",
+    )
+    parser.add_argument(
+        "--async-codec-queue-size",
+        type=int,
+        default=2,
+        help="Maximum queued audio-token batches for async codec decode. Lower values bound latency; higher values allow more buffering.",
+    )
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.6)
     parser.add_argument("--top-k", type=int, default=30)
     parser.add_argument("--repetition-penalty", type=float, default=1.1)
     parser.add_argument("--repetition-window", type=int, default=50)
-    parser.add_argument("--no-sample", action="store_true")
+    parser.add_argument("--no-sample", dest="no_sample", action="store_true", default=None)
+    parser.add_argument("--sample", dest="no_sample", action="store_false")
     parser.add_argument("--max-length", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -146,7 +191,44 @@ def parse_args() -> argparse.Namespace:
         default="false",
     )
     parser.add_argument("--dynamo-cache-size-limit", type=int, default=64)
-    return parser.parse_args()
+    args = parser.parse_args()
+    apply_runtime_profile(args)
+    return args
+
+
+def apply_runtime_profile(args: argparse.Namespace) -> None:
+    profiles = {
+        "interactive": {
+            "delta_chunk_chars": 8,
+            "decode_chunk_frames": 3,
+            "decode_overlap_frames": 0,
+            "drain_max_steps": 3,
+            "first_drain_max_steps": 1,
+            "async_codec_decode": False,
+            "no_sample": False,
+        },
+        "throughput": {
+            "delta_chunk_chars": 10000,
+            "decode_chunk_frames": 4096,
+            "decode_overlap_frames": 0,
+            "drain_max_steps": 512,
+            "first_drain_max_steps": 512,
+            "async_codec_decode": False,
+            "no_sample": True,
+        },
+        "custom": {
+            "delta_chunk_chars": 8,
+            "decode_chunk_frames": 3,
+            "decode_overlap_frames": 0,
+            "drain_max_steps": 3,
+            "first_drain_max_steps": 1,
+            "async_codec_decode": False,
+            "no_sample": False,
+        },
+    }
+    for name, value in profiles[args.runtime_profile].items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
 
 
 def chunk_text(text: str, chunk_chars: int, delay_s: float) -> Iterator[str]:
@@ -374,7 +456,112 @@ def note_audio_chunks(
         yield chunk
 
 
+def current_drain_max_steps(args: argparse.Namespace, metrics: dict[str, float] | None) -> int:
+    if metrics is not None and "first_audio_chunk_s" not in metrics:
+        return max(1, int(args.first_drain_max_steps))
+    return max(1, int(args.drain_max_steps))
+
+
+class AsyncCodecDecoder:
+    def __init__(
+        self,
+        decoder: AudioStreamDecoder,
+        codebook_size: int,
+        audio_eos_token: int,
+        *,
+        queue_size: int,
+        metrics: dict[str, float] | None = None,
+    ):
+        self._decoder = decoder
+        self._codebook_size = codebook_size
+        self._audio_eos_token = audio_eos_token
+        self._metrics = metrics
+        self._input_queue: Queue[list[torch.Tensor] | None] = Queue(maxsize=max(1, queue_size))
+        self._output_queue: Queue[tuple[str, object]] = Queue()
+        self._thread = Thread(target=self._worker, name="moss-codec-decoder", daemon=True)
+        self._closed = False
+        self._thread.start()
+
+    def submit(self, audio_frames: list[torch.Tensor]) -> None:
+        if self._closed:
+            raise RuntimeError("Async codec decoder is already closed.")
+        if self._metrics is not None:
+            self._metrics["async_decode_submitted_batches"] = (
+                self._metrics.get("async_decode_submitted_batches", 0) + 1
+            )
+            self._metrics["async_decode_submitted_frames"] = (
+                self._metrics.get("async_decode_submitted_frames", 0) + len(audio_frames)
+            )
+        started_at = time.perf_counter()
+        self._input_queue.put(audio_frames)
+        add_metric_time(self._metrics, "async_decode_input_queue_wait_s", time.perf_counter() - started_at)
+
+    def available_chunks(self) -> Iterator[np.ndarray]:
+        while True:
+            try:
+                kind, payload = self._output_queue.get_nowait()
+            except Empty:
+                return
+            if kind == "chunk":
+                yield payload
+            elif kind == "error":
+                raise payload
+            elif kind == "done":
+                raise RuntimeError("Async codec decoder finished before close_and_drain().")
+
+    def close_and_drain(self) -> Iterator[np.ndarray]:
+        if not self._closed:
+            self._closed = True
+            started_at = time.perf_counter()
+            self._input_queue.put(None)
+            add_metric_time(self._metrics, "async_decode_input_queue_wait_s", time.perf_counter() - started_at)
+
+        while True:
+            kind, payload = self._output_queue.get()
+            if kind == "chunk":
+                yield payload
+            elif kind == "error":
+                self._thread.join(timeout=1.0)
+                raise payload
+            elif kind == "done":
+                self._thread.join(timeout=1.0)
+                add_metric_time(self._metrics, "async_decode_thread_join_s", 0.0)
+                return
+
+    def _worker(self) -> None:
+        try:
+            while True:
+                audio_frames = self._input_queue.get()
+                if audio_frames is None:
+                    started_at = time.perf_counter()
+                    for chunk in flush_decoder(self._decoder):
+                        self._put_chunk(chunk)
+                    add_metric_time(self._metrics, "async_decoder_flush_worker_s", time.perf_counter() - started_at)
+                    self._output_queue.put(("done", None))
+                    return
+
+                started_at = time.perf_counter()
+                for chunk in decode_audio_frames(
+                    audio_frames,
+                    self._decoder,
+                    self._codebook_size,
+                    self._audio_eos_token,
+                ):
+                    self._put_chunk(chunk)
+                elapsed_s = time.perf_counter() - started_at
+                add_metric_time(self._metrics, "async_audio_token_decode_worker_s", elapsed_s)
+                add_metric_count(self._metrics, "async_audio_token_decode_worker_calls")
+        except BaseException as exc:
+            self._output_queue.put(("error", exc))
+
+    def _put_chunk(self, chunk: np.ndarray) -> None:
+        if self._metrics is not None:
+            self._metrics["async_decode_output_chunks"] = self._metrics.get("async_decode_output_chunks", 0) + 1
+        self._output_queue.put(("chunk", chunk))
+
+
 def run_streaming_tts(
+    args: argparse.Namespace,
     session: MossTTSRealtimeStreamingSession,
     codec,
     decoder: AudioStreamDecoder,
@@ -385,9 +572,13 @@ def run_streaming_tts(
     codebook_size = int(getattr(codec, "codebook_size", 1024))
     audio_eos_token = int(getattr(session.inferencer, "audio_eos_token", 1026))
 
+    if getattr(session, "codec", None) is not codec:
+        session.codec = codec
+
     with codec.streaming(batch_size=1):
         if metrics is not None:
             metrics["stream_start_perf"] = time.perf_counter()
+            metrics["async_codec_decode"] = False
         for delta in text_deltas:
             loop_started_at = time.perf_counter()
             if metrics is not None:
@@ -435,10 +626,12 @@ def run_streaming_tts(
         while True:
             sync_cuda_if_enabled(metrics)
             drain_started_at = time.perf_counter()
-            audio_frames = session.drain(max_steps=1)
+            drain_max_steps = current_drain_max_steps(args, metrics)
+            audio_frames = session.drain(max_steps=drain_max_steps)
             sync_cuda_if_enabled(metrics)
             add_metric_time(metrics, "session_drain_s", time.perf_counter() - drain_started_at)
             add_metric_count(metrics, "session_drain_calls")
+            add_metric_count(metrics, "session_drain_requested_steps", drain_max_steps)
             if not audio_frames:
                 break
             if metrics is not None:
@@ -457,6 +650,103 @@ def run_streaming_tts(
         flush_started_at = time.perf_counter()
         yield from note_audio_chunks(flush_decoder(decoder), metrics)
         add_metric_time(metrics, "decoder_flush_s", time.perf_counter() - flush_started_at)
+
+
+def run_streaming_tts_async_decode(
+    args: argparse.Namespace,
+    session: MossTTSRealtimeStreamingSession,
+    codec,
+    decoder: AudioStreamDecoder,
+    text_deltas: Iterator[str],
+    *,
+    queue_size: int,
+    metrics: dict[str, float] | None = None,
+    print_text: bool = True,
+) -> Iterator[np.ndarray]:
+    codebook_size = int(getattr(codec, "codebook_size", 1024))
+    audio_eos_token = int(getattr(session.inferencer, "audio_eos_token", 1026))
+
+    with codec.streaming(batch_size=1):
+        if metrics is not None:
+            metrics["stream_start_perf"] = time.perf_counter()
+            metrics["async_codec_decode"] = True
+            metrics["async_codec_queue_size"] = max(1, queue_size)
+        async_decoder = AsyncCodecDecoder(
+            decoder,
+            codebook_size,
+            audio_eos_token,
+            queue_size=queue_size,
+            metrics=metrics,
+        )
+
+        def submit_and_yield(audio_frames: list[torch.Tensor]) -> Iterator[np.ndarray]:
+            submit_started_at = time.perf_counter()
+            async_decoder.submit(audio_frames)
+            add_metric_time(metrics, "async_decode_submit_s", time.perf_counter() - submit_started_at)
+            yield from note_audio_chunks(async_decoder.available_chunks(), metrics)
+
+        try:
+            for delta in text_deltas:
+                yield from note_audio_chunks(async_decoder.available_chunks(), metrics)
+                loop_started_at = time.perf_counter()
+                if metrics is not None:
+                    metrics["text_delta_count"] = metrics.get("text_delta_count", 0) + 1
+                    metrics["text_chars_streamed"] = metrics.get("text_chars_streamed", 0) + len(delta)
+                if print_text:
+                    print_started_at = time.perf_counter()
+                    print(delta, end="", flush=True)
+                    add_metric_time(metrics, "stdout_print_s", time.perf_counter() - print_started_at)
+                sync_cuda_if_enabled(metrics)
+                model_started_at = time.perf_counter()
+                audio_frames = session.push_text(delta)
+                sync_cuda_if_enabled(metrics)
+                add_metric_time(metrics, "session_push_text_s", time.perf_counter() - model_started_at)
+                add_metric_count(metrics, "session_push_text_calls")
+                if metrics is not None:
+                    metrics["model_audio_frame_batches"] = metrics.get("model_audio_frame_batches", 0) + len(audio_frames)
+                    if audio_frames and "first_audio_tokens_s" not in metrics:
+                        metrics["first_audio_tokens_s"] = time.perf_counter() - metrics["stream_start_perf"]
+                yield from submit_and_yield(audio_frames)
+                add_metric_time(metrics, "stream_delta_loop_s", time.perf_counter() - loop_started_at)
+
+            sync_cuda_if_enabled(metrics)
+            end_started_at = time.perf_counter()
+            audio_frames = session.end_text()
+            sync_cuda_if_enabled(metrics)
+            add_metric_time(metrics, "session_end_text_s", time.perf_counter() - end_started_at)
+            add_metric_count(metrics, "session_end_text_calls")
+            if metrics is not None:
+                metrics["model_audio_frame_batches"] = metrics.get("model_audio_frame_batches", 0) + len(audio_frames)
+                if audio_frames and "first_audio_tokens_s" not in metrics:
+                    metrics["first_audio_tokens_s"] = time.perf_counter() - metrics["stream_start_perf"]
+            yield from submit_and_yield(audio_frames)
+
+            while True:
+                yield from note_audio_chunks(async_decoder.available_chunks(), metrics)
+                sync_cuda_if_enabled(metrics)
+                drain_started_at = time.perf_counter()
+                drain_max_steps = current_drain_max_steps(args, metrics)
+                audio_frames = session.drain(max_steps=drain_max_steps)
+                sync_cuda_if_enabled(metrics)
+                add_metric_time(metrics, "session_drain_s", time.perf_counter() - drain_started_at)
+                add_metric_count(metrics, "session_drain_calls")
+                add_metric_count(metrics, "session_drain_requested_steps", drain_max_steps)
+                if not audio_frames:
+                    break
+                if metrics is not None:
+                    metrics["model_audio_frame_batches"] = metrics.get("model_audio_frame_batches", 0) + len(audio_frames)
+                    if audio_frames and "first_audio_tokens_s" not in metrics:
+                        metrics["first_audio_tokens_s"] = time.perf_counter() - metrics["stream_start_perf"]
+                yield from submit_and_yield(audio_frames)
+                if session.inferencer.is_finished:
+                    break
+
+            yield from note_audio_chunks(async_decoder.close_and_drain(), metrics)
+        except BaseException:
+            if not async_decoder._closed:
+                async_decoder._closed = True
+                async_decoder._input_queue.put(None)
+            raise
 
 
 def consume_chunks(chunks: Iterator[np.ndarray]) -> tuple[int, float]:
@@ -534,6 +824,9 @@ def write_wav_with_metrics(
             "session_drain_s",
             "codec_decode_s",
             "audio_token_decode_iteration_s",
+            "async_audio_token_decode_worker_s",
+            "async_decode_input_queue_wait_s",
+            "async_decode_submit_s",
             "stdout_print_s",
             "write_wav_s",
         ):
@@ -599,10 +892,27 @@ def write_benchmark(metrics: dict[str, object], out_path: Path, args: argparse.N
         "audio_seconds_per_wall_second_after_first_chunk",
         "model_stream_calls_s",
         "model_stream_calls_pct_stream",
+        "runtime_profile",
+        "session_drain_calls",
+        "session_drain_requested_steps",
+        "drain_max_steps",
+        "first_drain_max_steps",
+        "async_codec_decode",
+        "async_codec_queue_size",
         "codec_decode_s",
         "codec_decode_s_pct_stream",
         "audio_token_decode_iteration_s",
         "audio_token_decode_iteration_s_pct_stream",
+        "async_audio_token_decode_worker_s",
+        "async_audio_token_decode_worker_s_pct_stream",
+        "async_audio_token_decode_worker_calls",
+        "async_decode_input_queue_wait_s",
+        "async_decode_input_queue_wait_s_pct_stream",
+        "async_decode_submit_s",
+        "async_decode_submit_s_pct_stream",
+        "async_decode_submitted_batches",
+        "async_decode_submitted_frames",
+        "async_decode_output_chunks",
         "write_wav_s",
         "chunk_interval_p50_s",
         "chunk_interval_p95_s",
@@ -622,7 +932,6 @@ def main() -> None:
     process_started_at = time.perf_counter()
     metrics: dict[str, object] | None = {} if args.benchmark else None
 
-    os.environ.setdefault("HF_HOME", str(ROOT_DIR / ".hf-cache"))
     configure_torch_runtime(args)
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -659,6 +968,7 @@ def main() -> None:
             {
                 "model_path": args.model_path,
                 "codec_path": args.codec_path,
+                "runtime_profile": args.runtime_profile,
                 "prompt_wav": str(prompt_wav),
                 "out_wav": str(out_path),
                 "device": str(device),
@@ -668,9 +978,19 @@ def main() -> None:
                 "delta_delay_s": args.delta_delay_s,
                 "decode_chunk_frames": args.decode_chunk_frames,
                 "decode_overlap_frames": args.decode_overlap_frames,
+                "drain_max_steps": args.drain_max_steps,
+                "first_drain_max_steps": args.first_drain_max_steps,
+                "async_codec_decode": args.async_codec_decode,
+                "async_codec_queue_size": args.async_codec_queue_size,
                 "codec_chunk_duration": args.codec_chunk_duration,
                 "sample_rate": args.sample_rate,
                 "max_length": args.max_length,
+                "no_sample": args.no_sample,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "repetition_penalty": args.repetition_penalty,
+                "repetition_window": args.repetition_window,
                 "local_compile": args.local_compile,
                 "local_compile_backend": args.local_compile_backend,
                 "local_compile_mode": args.local_compile_mode,
@@ -695,14 +1015,27 @@ def main() -> None:
             print(f"[INFO] warmup_run={warmup_idx + 1}/{args.warmup_runs}", file=sys.stderr)
             reset_session_for_generation(session, input_ids)
             warmup_decoder = create_decoder(args, codec, device)
-            warmup_chunks = run_streaming_tts(
-                session,
-                codec,
-                warmup_decoder,
-                make_text_deltas_from_text(args, args.text),
-                metrics=None,
-                print_text=False,
-            )
+            if args.async_codec_decode:
+                warmup_chunks = run_streaming_tts_async_decode(
+                    args,
+                    session,
+                    codec,
+                    warmup_decoder,
+                    make_text_deltas_from_text(args, args.text),
+                    queue_size=args.async_codec_queue_size,
+                    metrics=None,
+                    print_text=False,
+                )
+            else:
+                warmup_chunks = run_streaming_tts(
+                    args,
+                    session,
+                    codec,
+                    warmup_decoder,
+                    make_text_deltas_from_text(args, args.text),
+                    metrics=None,
+                    print_text=False,
+                )
             sample_count, elapsed_s = consume_chunks(warmup_chunks)
             warmup_records.append(
                 {
@@ -718,7 +1051,18 @@ def main() -> None:
         decoder = create_decoder(args, codec, device)
         text_deltas = make_text_deltas_from_text(args, args.text)
 
-    wav_chunks = run_streaming_tts(session, codec, decoder, text_deltas, metrics=metrics)
+    if args.async_codec_decode:
+        wav_chunks = run_streaming_tts_async_decode(
+            args,
+            session,
+            codec,
+            decoder,
+            text_deltas,
+            queue_size=args.async_codec_queue_size,
+            metrics=metrics,
+        )
+    else:
+        wav_chunks = run_streaming_tts(args, session, codec, decoder, text_deltas, metrics=metrics)
     if metrics is not None:
         write_wav_with_metrics(out_path, args.sample_rate, wav_chunks, metrics=metrics)
         metrics["process_total_s"] = time.perf_counter() - process_started_at

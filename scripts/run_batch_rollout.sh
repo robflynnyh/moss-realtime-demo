@@ -29,12 +29,8 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-run_demo() {
-  "$PYTHON_BIN" "$ROOT_DIR/scripts/moss_streaming_demo.py" "$@"
-}
-
 if [[ "${RUN_WITH_GPU_SCHEDULER:-1}" == "1" ]]; then
-  exec "$WITH_GPU" "$GPU_POOL" -- "$PYTHON_BIN" "$ROOT_DIR/scripts/moss_streaming_demo.py" "$@"
+  exec "$WITH_GPU" "$GPU_POOL" -- "$PYTHON_BIN" "$ROOT_DIR/scripts/moss_batch_rollout.py" "$@"
 fi
 
-run_demo "$@"
+exec "$PYTHON_BIN" "$ROOT_DIR/scripts/moss_batch_rollout.py" "$@"

@@ -51,11 +51,15 @@ scripts/run_streaming_demo.sh \
   --text "Welcome to the realtime MOSS streaming demo. This sentence is fed to the model in small text chunks."
 ```
 
-For stdin streaming:
+The default runtime profile is `throughput`, which optimizes generated audio
+seconds per wall second. For live stdin/text streaming, use the interactive
+profile:
 
 ```bash
 printf 'This text arrives through stdin and is chunked into deltas for realtime synthesis.\n' \
-  | scripts/run_streaming_demo.sh --prompt-wav prompts/fdr_fireside_12s.wav
+  | scripts/run_streaming_demo.sh \
+      --runtime-profile interactive \
+      --prompt-wav prompts/fdr_fireside_12s.wav
 ```
 
 Outputs default to timestamped WAV files in `outputs/`.
@@ -69,6 +73,7 @@ writes JSON next to the WAV as `<output>.benchmark.json`.
 scripts/run_streaming_demo.sh \
   --benchmark \
   --warmup-runs 1 \
+  --runtime-profile throughput \
   --prompt-wav prompts/nabu_joe_en_us_12s.wav \
   --out-wav outputs/bench_joe.wav \
   --text "Benchmarking the realtime streaming path with a short test sentence."
@@ -80,6 +85,24 @@ interval p50/p95/max, output duration, total streaming time, generated audio
 seconds per wall-clock second, realtime factor, and a stage breakdown for model
 streaming calls versus codec waveform decoding.
 
+The demo also has an experimental async codec path:
+
+```bash
+scripts/run_streaming_demo.sh \
+  --benchmark \
+  --async-codec-decode \
+  --prompt-wav prompts/nabu_joe_en_us_12s.wav \
+  --out-wav outputs/bench_async_codec.wav \
+  --text "Benchmarking asynchronous codec decoding with the same realtime text stream."
+```
+
+It queues audio-token batches to a worker thread while the main thread continues
+token generation. On this RTX A4500, deterministic short-run tests were slower
+with async decode (`0.499` audio seconds per wall second) than the serial
+default (`0.519`), because concurrent model and codec kernels contend on the
+same GPU. Keep serial decode as the default here, and use `--async-codec-decode`
+only for comparison or on hardware with more scheduling headroom.
+
 For more accurate stage attribution, add `--benchmark-synchronize`. It inserts
 CUDA synchronizations around profiled model and codec stages, so it can perturb
 absolute latency but better answers where time is being spent.
@@ -90,8 +113,17 @@ Compare multiple benchmark JSON files with:
 scripts/compare_benchmarks.py outputs/*.benchmark.json
 ```
 
-The default runtime path is optimized for the local RTX A4500 measurements: BF16
-is used for model weights when CUDA supports it, local-transformer
+`--runtime-profile throughput` is now the default. It feeds full text in one
+delta, drains the audio-token model in large batches, disables sampling, and
+decodes the waveform at flush time. On the deterministic short A4500 test this
+profile reached `0.672` generated audio seconds per wall second versus `0.531`
+for the best interactive drain profile.
+
+Use `--runtime-profile interactive` when first-audio/chunk cadence matters. The
+interactive profile uses smaller text deltas, `--decode-chunk-frames 3`,
+`--drain-max-steps 3`, `--first-drain-max-steps 1`, and sampling enabled.
+
+The runtime path uses BF16 for model weights when CUDA supports it, local-transformer
 `torch.compile` is off by default because it was much slower for this streaming
 shape pattern, and TF32 is allowed for remaining FP32 CUDA matmuls unless
 `--no-allow-tf32` is passed. You can still test compilation with
@@ -105,8 +137,56 @@ then compare quality/speed before restoring the default penalty.
 `--decode-chunk-frames` controls latency/throughput tradeoff in the audio
 token-to-waveform decoder. On the short A4500 benchmark, `1` gave the fastest
 first/chunk cadence but slowest throughput, `8` gave the best throughput but
-over one second between chunks, and the default `3` was the best interactive
-middle ground.
+over one second between chunks, and `3` was the best interactive middle ground.
+The throughput profile sets this to `4096`, which effectively decodes once at
+the end.
+
+`--drain-max-steps` controls how many autoregressive audio-token steps are run
+per post-text drain call after the first audio chunk. The default is `3` with
+`--first-drain-max-steps 1`: this keeps first-audio latency conservative while
+reducing Python/GPU round trips after audio has started. On the deterministic
+short A4500 test, drain `3` cut drain calls from `74` to `25`, improved
+throughput from `0.519` to `0.531` generated audio seconds per wall second, and
+kept chunk p95 near `0.45s`.
+
+## RL Rollout Batching
+
+For offline RL rollout generation, use the batched runner:
+
+```bash
+scripts/run_batch_rollout.sh \
+  --benchmark \
+  --batch-size 2 \
+  --max-audio-steps 512 \
+  --prompt-wav prompts/nabu_joe_en_us_12s.wav \
+  --text "First full rollout text goes here." \
+  --text "Second full rollout text goes here."
+```
+
+It bypasses the single-stream `MossTTSRealtimeStreamingSession` and calls the
+lower-level batch-shaped `MossTTSRealtimeInference.prefill()` and `step()` APIs
+directly. It feeds each rollout as a full text prefix, drains audio-token
+generation until EOS or `--max-audio-steps`, decodes all samples with one codec
+`batch_decode()` call per microbatch, and writes WAVs plus `manifest.json` under
+the output directory.
+
+You can also pass a file:
+
+```bash
+scripts/run_batch_rollout.sh \
+  --benchmark \
+  --batch-size 2 \
+  --texts-file rollout_texts.jsonl
+```
+
+Plain text files are read as one rollout per non-empty line. JSONL files should
+contain a `text` field and may include an `id` field for the output filename.
+The benchmark manifest separates setup, prompt encode, text prefill,
+autoregressive audio-token generation, codec batch decode, WAV writing, and
+aggregate generated audio seconds per wall second.
+
+On the 20 GB RTX A4500, start with batch size `2` and measure memory before
+trying `4+`; KV cache and generated-token history will grow with output length.
 
 FlashAttention 2 was tested in a separate `.venv-fa2` environment so the stable
 demo `.venv` stayed untouched. It imports and runs, but on the local RTX A4500
