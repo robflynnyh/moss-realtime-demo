@@ -165,10 +165,19 @@ scripts/run_batch_rollout.sh \
 
 It bypasses the single-stream `MossTTSRealtimeStreamingSession` and calls the
 lower-level batch-shaped `MossTTSRealtimeInference.prefill()` and `step()` APIs
-directly. It feeds each rollout as a full text prefix, drains audio-token
+directly. The default `--packing-mode interleaved` matches the latency-oriented
+streaming scheme: prefill the first text tokens, then repeatedly step a vector
+of the next text token per sample plus the previous audio tokens, using text-pad
+tokens for samples whose text is exhausted. It then drains audio-token
 generation until EOS or `--max-audio-steps`, decodes all samples with one codec
 `batch_decode()` call per microbatch, and writes WAVs plus `manifest.json` under
 the output directory.
+
+Use `--prefill-text-len` to override the initial text prefix length. By default
+it uses the processor delay length, currently `12` tokens. The older
+throughput-only behavior is still available as `--packing-mode full-text`; that
+prefills the full text before audio-token drain and is not the deployment
+streaming layout.
 
 You can also pass a file:
 
@@ -182,15 +191,18 @@ scripts/run_batch_rollout.sh \
 Plain text files are read as one rollout per non-empty line. JSONL files should
 contain a `text` field and may include an `id` field for the output filename.
 The benchmark manifest separates setup, prompt encode, text prefill,
-autoregressive audio-token generation, codec batch decode, WAV writing, and
-aggregate generated audio seconds per wall second. It also records peak CUDA
+interleaved text/audio stepping, codec batch decode, WAV writing, and aggregate
+generated audio seconds per wall second. It also records packing mode,
+prefill/stepped text-token counts, drain-step counts, and peak CUDA
 allocated/reserved memory per microbatch.
 
-On the 20 GB RTX A4500, a short fixed-shape sweep with `--max-audio-steps 64`
-kept improving up to batch size `96`. Batch size `128` OOMed during codec
-waveform `batch_decode()`, not during audio-token generation. Treat `96` as the
-measured high-throughput cap for short rollouts, and use `64` when you want more
-memory headroom or longer outputs.
+On the 20 GB RTX A4500, an earlier short fixed-shape sweep with
+`--packing-mode full-text --max-audio-steps 64` kept improving up to batch size
+`96`. Batch size `128` OOMed during codec waveform `batch_decode()`, not during
+audio-token generation. Treat `96` as the measured high-throughput cap for
+short full-text rollouts, and use `64` when you want more memory headroom or
+longer outputs. Re-run the sweep with `--packing-mode interleaved` and your
+target text/output lengths before using the cap for RL data generation.
 
 | batch size | audio seconds / batch wall second | peak allocated | peak reserved |
 | --- | ---: | ---: | ---: |

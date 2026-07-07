@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=None, help="Defaults to outputs/batch_rollout_<timestamp>.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
+        "--packing-mode",
+        choices=["interleaved", "full-text"],
+        default="interleaved",
+        help="interleaved matches streaming deployment: prefill a short text prefix, then step next text token plus previous audio. full-text prefills all text before audio drain.",
+    )
+    parser.add_argument(
+        "--prefill-text-len",
+        type=int,
+        default=None,
+        help="Initial text tokens per sample for interleaved mode. Defaults to the processor delay length.",
+    )
+    parser.add_argument(
         "--max-audio-steps",
         type=int,
         default=512,
@@ -132,6 +144,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--batch-size must be >= 1.")
     if args.max_audio_steps < 0:
         raise ValueError("--max-audio-steps must be >= 0.")
+    if args.prefill_text_len is not None and args.prefill_text_len < 1:
+        raise ValueError("--prefill-text-len must be >= 1.")
     return args
 
 
@@ -323,9 +337,47 @@ def cuda_peak_memory(device: torch.device) -> dict[str, float]:
     }
 
 
+def initial_text_prefixes(
+    tokenized: list[list[int]],
+    *,
+    packing_mode: str,
+    prefill_text_len: int,
+) -> tuple[list[list[int]], list[int]]:
+    if packing_mode == "full-text":
+        return [list(ids) for ids in tokenized], [len(ids) for ids in tokenized]
+
+    prefixes = []
+    cursors = []
+    for ids in tokenized:
+        prefix_len = min(len(ids), prefill_text_len)
+        prefixes.append(list(ids[:prefix_len]))
+        cursors.append(prefix_len)
+    return prefixes, cursors
+
+
+def next_interleaved_text_tokens(
+    tokenized: list[list[int]],
+    cursors: list[int],
+    stopped: list[bool],
+    *,
+    text_pad_id: int,
+) -> tuple[list[int], int]:
+    text_tokens = []
+    real_token_count = 0
+    for batch_idx, ids in enumerate(tokenized):
+        if stopped[batch_idx] or cursors[batch_idx] >= len(ids):
+            text_tokens.append(text_pad_id)
+            continue
+        text_tokens.append(int(ids[cursors[batch_idx]]))
+        cursors[batch_idx] += 1
+        real_token_count += 1
+    return text_tokens, real_token_count
+
+
 def generate_microbatch(
     args: argparse.Namespace,
     tokenizer,
+    prefill_text_len: int,
     inferencer: MossTTSRealtimeInference,
     codec,
     prefix_input_ids: np.ndarray,
@@ -355,6 +407,13 @@ def generate_microbatch(
     }
     codebook_size = int(getattr(codec, "codebook_size", 1024))
     audio_eos_token = int(getattr(inferencer, "audio_eos_token", 1026))
+    text_pad_id = int(getattr(inferencer, "text_pad_id", 151655))
+    text_prefixes, text_cursors = initial_text_prefixes(
+        tokenized,
+        packing_mode=args.packing_mode,
+        prefill_text_len=prefill_text_len,
+    )
+    post_prefill_cursors = list(text_cursors)
 
     sync_cuda_if_enabled(metrics)
     started = time.perf_counter()
@@ -362,7 +421,7 @@ def generate_microbatch(
     prefill_kwargs["repetition_penalty"] = None
     first_tokens = inferencer.prefill(
         input_ids=[prefix_input_ids] * len(items),
-        text_prefix_ids=tokenized,
+        text_prefix_ids=text_prefixes,
         **prefill_kwargs,
     )
     sync_cuda_if_enabled(metrics)
@@ -379,8 +438,26 @@ def generate_microbatch(
     started = time.perf_counter()
     step_count = 0
     appended_count = 0
+    text_step_calls = 0
+    drain_step_calls = 0
+    text_tokens_stepped = 0
     while step_count < args.max_audio_steps and not all(stopped) and not inferencer.is_finished:
-        tokens = inferencer.step(None, **generation_kwargs)
+        if args.packing_mode == "interleaved":
+            text_arg, real_token_count = next_interleaved_text_tokens(
+                tokenized,
+                text_cursors,
+                stopped,
+                text_pad_id=text_pad_id,
+            )
+            if real_token_count:
+                text_step_calls += 1
+                text_tokens_stepped += real_token_count
+            else:
+                drain_step_calls += 1
+        else:
+            text_arg = None
+            drain_step_calls += 1
+        tokens = inferencer.step(text_arg, **generation_kwargs)
         appended_count += append_valid_tokens(
             tokens,
             per_sample_tokens,
@@ -446,9 +523,21 @@ def generate_microbatch(
         "audio_duration_s": audio_duration_s,
         "audio_seconds_per_wall_second": audio_duration_s / batch_total_s if batch_total_s else None,
         "audio_seconds_per_generate_second": audio_duration_s / generate_s if generate_s else None,
-        "prefill_text_tokens": sum(len(ids) for ids in tokenized),
-        "decode_text_tokens_per_s": sum(len(ids) for ids in tokenized) / prefill_s if prefill_s else None,
+        "packing_mode": args.packing_mode,
+        "prefill_text_len": prefill_text_len,
+        "prefill_text_tokens": sum(len(ids) for ids in text_prefixes),
+        "total_text_tokens": sum(len(ids) for ids in tokenized),
+        "remaining_text_tokens_after_prefill": sum(
+            max(0, len(ids) - cursor) for ids, cursor in zip(tokenized, post_prefill_cursors)
+        ),
+        "remaining_text_tokens_after_generation": sum(
+            max(0, len(ids) - cursor) for ids, cursor in zip(tokenized, text_cursors)
+        ),
+        "text_tokens_stepped": text_tokens_stepped,
+        "prefill_text_tokens_per_s": sum(len(ids) for ids in text_prefixes) / prefill_s if prefill_s else None,
         "audio_step_calls": step_count,
+        "text_step_calls": text_step_calls,
+        "drain_step_calls": drain_step_calls,
         "audio_token_frames_appended_after_prefill": appended_count,
         "max_audio_steps": args.max_audio_steps,
         "all_stopped": all(stopped),
@@ -495,6 +584,8 @@ def main() -> None:
         "attn_implementation": args.attn_implementation,
         "batch_size": args.batch_size,
         "item_count": len(items),
+        "packing_mode": args.packing_mode,
+        "prefill_text_len": args.prefill_text_len,
         "max_audio_steps": args.max_audio_steps,
         "max_length": args.max_length,
         "sample_rate": args.sample_rate,
@@ -522,9 +613,14 @@ def main() -> None:
     print(f"[INFO] device={device} cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     print(f"[INFO] prompt_wav={prompt_wav}")
     print(f"[INFO] out_dir={out_dir}")
-    print(f"[INFO] items={len(items)} batch_size={args.batch_size} max_audio_steps={args.max_audio_steps}")
+    print(
+        f"[INFO] items={len(items)} batch_size={args.batch_size} "
+        f"packing_mode={args.packing_mode} max_audio_steps={args.max_audio_steps}"
+    )
 
-    tokenizer, _processor, _model, codec, inferencer, prefix_input_ids = load_stack(args, device, metrics)
+    tokenizer, processor, _model, codec, inferencer, prefix_input_ids = load_stack(args, device, metrics)
+    prefill_text_len = int(args.prefill_text_len or processor.delay_tokens_len)
+    metrics["prefill_text_len"] = prefill_text_len
 
     batch_records = []
     for batch_index, batch_items in enumerate(batched(items, args.batch_size)):
@@ -532,6 +628,7 @@ def main() -> None:
         batch_record = generate_microbatch(
             args,
             tokenizer,
+            prefill_text_len,
             inferencer,
             codec,
             prefix_input_ids,
@@ -555,10 +652,18 @@ def main() -> None:
     total_batch_wall_s = sum(batch["batch_total_s"] for batch in batch_records)
     total_generate_s = sum(batch["generate_s"] for batch in batch_records)
     total_prefill_s = sum(batch["prefill_s"] for batch in batch_records)
+    total_prefill_text_tokens = sum(batch.get("prefill_text_tokens", 0) for batch in batch_records)
+    total_text_tokens_stepped = sum(batch.get("text_tokens_stepped", 0) for batch in batch_records)
+    total_text_step_calls = sum(batch.get("text_step_calls", 0) for batch in batch_records)
+    total_drain_step_calls = sum(batch.get("drain_step_calls", 0) for batch in batch_records)
     metrics["total_audio_duration_s"] = total_audio_s
     metrics["total_batch_wall_s"] = total_batch_wall_s
     metrics["total_prefill_s"] = total_prefill_s
     metrics["total_generate_s"] = total_generate_s
+    metrics["total_prefill_text_tokens"] = total_prefill_text_tokens
+    metrics["total_text_tokens_stepped"] = total_text_tokens_stepped
+    metrics["total_text_step_calls"] = total_text_step_calls
+    metrics["total_drain_step_calls"] = total_drain_step_calls
     metrics["audio_seconds_per_batch_wall_second"] = (
         total_audio_s / total_batch_wall_s if total_batch_wall_s else None
     )
@@ -581,8 +686,14 @@ def main() -> None:
     for key in (
         "setup_total_s",
         "prompt_encode_s",
+        "packing_mode",
+        "prefill_text_len",
         "total_prefill_s",
         "total_generate_s",
+        "total_prefill_text_tokens",
+        "total_text_tokens_stepped",
+        "total_text_step_calls",
+        "total_drain_step_calls",
         "codec_batch_decode_s",
         "total_batch_wall_s",
         "total_audio_duration_s",
