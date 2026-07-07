@@ -184,6 +184,10 @@ This keeps large rollout batches from OOMing in codec `batch_decode()` after
 audio-token generation has already succeeded. Pass `--codec-decode-batch-size 0`
 to decode the full microbatch at once when you know it fits.
 
+Sampling uses the model defaults unless overridden. For unfiltered sampling,
+pass `--sample --top-p 1 --top-k 0`; the batch runner converts those to disabled
+top-p/top-k filters in the manifest.
+
 You can also pass a file:
 
 ```bash

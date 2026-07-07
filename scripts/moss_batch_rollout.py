@@ -154,6 +154,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--prefill-text-len must be >= 1.")
     if args.codec_decode_batch_size < 0:
         raise ValueError("--codec-decode-batch-size must be >= 0.")
+    if args.top_k is not None and args.top_k <= 0:
+        args.top_k = None
+    if args.top_p is not None and args.top_p >= 1.0:
+        args.top_p = None
     return args
 
 
