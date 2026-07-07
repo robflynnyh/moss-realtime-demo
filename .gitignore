@@ -1,0 +1,10 @@
+.venv/
+.venv-fa2/
+.venv-sglang/
+.uv-cache/
+.hf-cache/
+outputs/
+prompts/*.wav
+prompts/raw/
+__pycache__/
+*.pyc

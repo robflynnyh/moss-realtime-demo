@@ -1,0 +1,6 @@
+[submodule "vendor/MOSS-TTS"]
+	path = vendor/MOSS-TTS
+	url = https://github.com/OpenMOSS/MOSS-TTS.git
+[submodule "vendor/sglang-omni"]
+	path = vendor/sglang-omni
+	url = https://github.com/sgl-project/sglang-omni.git
