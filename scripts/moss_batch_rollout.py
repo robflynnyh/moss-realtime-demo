@@ -202,15 +202,17 @@ def read_text_items(args: argparse.Namespace) -> list[TextItem]:
                 text = str(record["text"])
                 item_id = str(record.get("id") or record.get("uid") or f"line_{line_no:04d}")
                 prompt_wav = record.get("prompt_wav")
+                item_idx = int(record.get("idx", len(items)))
             else:
                 text = raw_line
                 item_id = f"line_{line_no:04d}"
                 prompt_wav = None
+                item_idx = len(items)
             if text.strip():
                 prompt_path = None
                 if prompt_wav:
                     prompt_path = resolve_repo_path(str(prompt_wav), ROOT_DIR / str(prompt_wav))
-                items.append(TextItem(len(items), item_id, text, prompt_path))
+                items.append(TextItem(item_idx, item_id, text, prompt_path))
 
     if not items:
         raise ValueError("Pass at least one --text or --texts-file item.")
