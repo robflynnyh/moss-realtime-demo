@@ -404,7 +404,17 @@ def decode_batch(
     metrics["codec_batch_decode_calls"] = metrics.get("codec_batch_decode_calls", 0) + subbatch_count
     metrics["codec_decode_subbatch_count"] = metrics.get("codec_decode_subbatch_count", 0) + subbatch_count
     metrics["codec_decode_effective_batch_size"] = largest_subbatch
-    return torch.cat(audio_chunks, dim=0), torch.cat(length_chunks, dim=0)
+    max_audio_len = max(chunk.shape[-1] for chunk in audio_chunks)
+    padded_audio_chunks = []
+    for chunk in audio_chunks:
+        if chunk.shape[-1] == max_audio_len:
+            padded_audio_chunks.append(chunk)
+            continue
+        pad_shape = list(chunk.shape)
+        pad_shape[-1] = max_audio_len - chunk.shape[-1]
+        padding = torch.zeros(pad_shape, dtype=chunk.dtype, device=chunk.device)
+        padded_audio_chunks.append(torch.cat([chunk, padding], dim=-1))
+    return torch.cat(padded_audio_chunks, dim=0), torch.cat(length_chunks, dim=0)
 
 
 def reset_cuda_peak(device: torch.device) -> None:
