@@ -47,6 +47,7 @@ class TextItem:
     idx: int
     item_id: str
     text: str
+    prompt_wav: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,20 +201,46 @@ def read_text_items(args: argparse.Namespace) -> list[TextItem]:
                     raise ValueError(f"{path}:{line_no} is missing a text field.")
                 text = str(record["text"])
                 item_id = str(record.get("id") or record.get("uid") or f"line_{line_no:04d}")
+                prompt_wav = record.get("prompt_wav")
             else:
                 text = raw_line
                 item_id = f"line_{line_no:04d}"
+                prompt_wav = None
             if text.strip():
-                items.append(TextItem(len(items), item_id, text))
+                prompt_path = None
+                if prompt_wav:
+                    prompt_path = resolve_repo_path(str(prompt_wav), ROOT_DIR / str(prompt_wav))
+                items.append(TextItem(len(items), item_id, text, prompt_path))
 
     if not items:
         raise ValueError("Pass at least one --text or --texts-file item.")
     return items
 
 
+def resolve_item_prompt_wavs(items: list[TextItem], default_prompt_wav: Path) -> list[TextItem]:
+    resolved = []
+    for item in items:
+        prompt_wav = item.prompt_wav or default_prompt_wav
+        if not prompt_wav.exists():
+            raise FileNotFoundError(f"Prompt WAV not found for item {item.item_id}: {prompt_wav}")
+        resolved.append(TextItem(item.idx, item.item_id, item.text, prompt_wav.resolve()))
+    return resolved
+
+
 def batched(items: list[TextItem], batch_size: int):
     for start in range(0, len(items), batch_size):
         yield items[start : start + batch_size]
+
+
+def batched_by_prompt(items: list[TextItem], batch_size: int):
+    groups: dict[Path, list[TextItem]] = {}
+    for item in items:
+        if item.prompt_wav is None:
+            raise ValueError(f"Internal error: item {item.item_id} has no resolved prompt_wav")
+        groups.setdefault(item.prompt_wav, []).append(item)
+    for prompt_wav, group_items in groups.items():
+        for batch_items in batched(group_items, batch_size):
+            yield prompt_wav, batch_items
 
 
 def write_pcm16_wav(path: Path, sample_rate: int, audio: torch.Tensor) -> int:
@@ -241,11 +268,45 @@ def build_rollout_prefix(processor, tokenizer, prompt_tokens: np.ndarray) -> np.
     return np.concatenate([system_prompt, assistant_prefix], axis=0)
 
 
+def encode_prompt_prefix(
+    args: argparse.Namespace,
+    processor,
+    tokenizer,
+    codec,
+    prompt_wav: Path,
+    device: torch.device,
+    metrics: dict[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    prompt_metrics: dict[str, Any] = {"prompt_wav": str(prompt_wav)}
+    with torch.inference_mode():
+        started = time.perf_counter()
+        prompt_audio = _load_audio(prompt_wav, target_sample_rate=args.sample_rate)
+        prompt_metrics["prompt_audio_load_s"] = time.perf_counter() - started
+        prompt_metrics["prompt_audio_duration_s"] = float(prompt_audio.shape[-1]) / float(args.sample_rate)
+
+        sync_cuda_if_enabled(metrics)
+        started = time.perf_counter()
+        prompt_result = codec.encode(
+            prompt_audio.unsqueeze(0).to(device),
+            chunk_duration=args.codec_chunk_duration,
+        )
+        prompt_tokens = _extract_codes(prompt_result).cpu().numpy().squeeze(1)
+        sync_cuda_if_enabled(metrics)
+        prompt_metrics["prompt_encode_s"] = time.perf_counter() - started
+        prompt_metrics["prompt_token_shape"] = list(prompt_tokens.shape)
+
+    started = time.perf_counter()
+    prefix_input_ids = build_rollout_prefix(processor, tokenizer, prompt_tokens)
+    prompt_metrics["prefix_build_s"] = time.perf_counter() - started
+    prompt_metrics["prefix_shape"] = list(prefix_input_ids.shape)
+    return prefix_input_ids, prompt_metrics
+
+
 def load_stack(
     args: argparse.Namespace,
     device: torch.device,
     metrics: dict[str, Any],
-) -> tuple[Any, Any, Any, Any, Any, np.ndarray]:
+) -> tuple[Any, Any, Any, Any, Any]:
     setup_started = time.perf_counter()
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     metrics["dtype"] = str(dtype).replace("torch.", "")
@@ -271,32 +332,10 @@ def load_stack(
     codec = load_codec(args.codec_path, device)
     metrics["codec_load_s"] = time.perf_counter() - started
 
-    with torch.inference_mode():
-        started = time.perf_counter()
-        prompt_audio = _load_audio(Path(args.prompt_wav), target_sample_rate=args.sample_rate)
-        metrics["prompt_audio_load_s"] = time.perf_counter() - started
-        metrics["prompt_audio_duration_s"] = float(prompt_audio.shape[-1]) / float(args.sample_rate)
-
-        sync_cuda_if_enabled(metrics)
-        started = time.perf_counter()
-        prompt_result = codec.encode(
-            prompt_audio.unsqueeze(0).to(device),
-            chunk_duration=args.codec_chunk_duration,
-        )
-        prompt_tokens = _extract_codes(prompt_result).cpu().numpy().squeeze(1)
-        sync_cuda_if_enabled(metrics)
-        metrics["prompt_encode_s"] = time.perf_counter() - started
-        metrics["prompt_token_shape"] = list(prompt_tokens.shape)
-
-    started = time.perf_counter()
-    prefix_input_ids = build_rollout_prefix(processor, tokenizer, prompt_tokens)
-    metrics["prefix_build_s"] = time.perf_counter() - started
-    metrics["prefix_shape"] = list(prefix_input_ids.shape)
-
     inferencer = MossTTSRealtimeInference(model, tokenizer, max_length=args.max_length)
     configure_local_compile(inferencer, args, metrics=metrics)
     metrics["setup_total_s"] = time.perf_counter() - setup_started
-    return tokenizer, processor, model, codec, inferencer, prefix_input_ids
+    return tokenizer, processor, model, codec, inferencer
 
 
 def append_valid_tokens(
@@ -570,6 +609,7 @@ def generate_microbatch(
                 "idx": item.idx,
                 "id": item.item_id,
                 "path": path_for_record,
+                "prompt_wav": str(item.prompt_wav) if item.prompt_wav else None,
                 "text_chars": len(item.text),
                 "text_tokens": len(tokenized[local_idx]),
                 "audio_token_frames": token_frames[local_idx],
@@ -660,13 +700,19 @@ def main() -> None:
 
     out_dir = resolve_repo_path(args.out_dir, default_out_dir())
     out_dir.mkdir(parents=True, exist_ok=True)
-    items = read_text_items(args)
+    items = resolve_item_prompt_wavs(read_text_items(args), prompt_wav.resolve())
+    unique_prompt_wavs = sorted(
+        {item.prompt_wav for item in items if item.prompt_wav is not None},
+        key=lambda path: str(path),
+    )
     device = torch.device(args.device)
 
     metrics: dict[str, Any] = {
         "model_path": args.model_path,
         "codec_path": args.codec_path,
         "prompt_wav": str(prompt_wav),
+        "prompt_wavs": [str(path) for path in unique_prompt_wavs],
+        "prompt_wav_count": len(unique_prompt_wavs),
         "out_dir": str(out_dir),
         "device": str(device),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -708,25 +754,54 @@ def main() -> None:
         f"packing_mode={args.packing_mode} max_audio_steps={args.max_audio_steps}"
     )
 
-    tokenizer, processor, _model, codec, inferencer, prefix_input_ids = load_stack(args, device, metrics)
+    tokenizer, processor, _model, codec, inferencer = load_stack(args, device, metrics)
     prefill_text_len = int(args.prefill_text_len or processor.delay_tokens_len)
     metrics["prefill_text_len"] = prefill_text_len
 
+    prefix_cache: dict[Path, np.ndarray] = {}
+    prompt_records = []
+    for prompt_index, item_prompt_wav in enumerate(unique_prompt_wavs):
+        prefix_cache[item_prompt_wav], prompt_record = encode_prompt_prefix(
+            args,
+            processor,
+            tokenizer,
+            codec,
+            item_prompt_wav,
+            device,
+            metrics,
+        )
+        prompt_record["prompt_index"] = prompt_index
+        prompt_records.append(prompt_record)
+    metrics["prompts"] = prompt_records
+    if prompt_records:
+        first_prompt = prompt_records[0]
+        metrics["prompt_audio_load_s"] = first_prompt.get("prompt_audio_load_s")
+        metrics["prompt_audio_duration_s"] = first_prompt.get("prompt_audio_duration_s")
+        metrics["prompt_encode_s"] = first_prompt.get("prompt_encode_s")
+        metrics["prompt_token_shape"] = first_prompt.get("prompt_token_shape")
+        metrics["prefix_build_s"] = first_prompt.get("prefix_build_s")
+        metrics["prefix_shape"] = first_prompt.get("prefix_shape")
+    metrics["total_prompt_encode_s"] = sum(record.get("prompt_encode_s", 0.0) for record in prompt_records)
+
     batch_records = []
-    for batch_index, batch_items in enumerate(batched(items, args.batch_size)):
-        print(f"[INFO] batch={batch_index} size={len(batch_items)} ids={[item.item_id for item in batch_items]}")
+    for batch_index, (batch_prompt_wav, batch_items) in enumerate(batched_by_prompt(items, args.batch_size)):
+        print(
+            f"[INFO] batch={batch_index} size={len(batch_items)} "
+            f"prompt_wav={batch_prompt_wav} ids={[item.item_id for item in batch_items]}"
+        )
         batch_record = generate_microbatch(
             args,
             tokenizer,
             prefill_text_len,
             inferencer,
             codec,
-            prefix_input_ids,
+            prefix_cache[batch_prompt_wav],
             batch_items,
             out_dir,
             batch_index,
             metrics,
         )
+        batch_record["prompt_wav"] = str(batch_prompt_wav)
         batch_records.append(batch_record)
         print(
             "[BATCH] "

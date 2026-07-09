@@ -199,6 +199,18 @@ scripts/run_batch_rollout.sh \
 
 Plain text files are read as one rollout per non-empty line. JSONL files should
 contain a `text` field and may include an `id` field for the output filename.
+JSONL rows may also include `prompt_wav` to override the global `--prompt-wav`
+for that item:
+
+```json
+{"id":"speaker_a_0001","text":"Text to synthesize.","prompt_wav":"prompts/speaker_a_ref.wav"}
+{"id":"speaker_b_0001","text":"Another utterance.","prompt_wav":"prompts/speaker_b_ref.wav"}
+```
+
+When per-item prompt WAVs are present, the runner groups rollout items by
+resolved prompt path before forming microbatches. This keeps each microbatch on
+one speaker-conditioning prefix while still allowing one mixed-speaker JSONL
+file.
 The benchmark manifest separates setup, prompt encode, text prefill,
 interleaved text/audio stepping, codec batch decode, WAV writing, and aggregate
 generated audio seconds per wall second. It also records packing mode,
